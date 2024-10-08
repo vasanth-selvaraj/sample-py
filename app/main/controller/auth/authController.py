@@ -2,7 +2,7 @@ from flask import Blueprint, request, jsonify, make_response
 from app.main import db
 from psycopg2 import sql
 from app.main.models.users import User
-from app.main.config import Config
+from app.main.config import config_by_name,Config
 import uuid
 import jwt
 import datetime
@@ -13,6 +13,7 @@ from app.main.utils.middleware import auth_token_required
 
 auth_blueprint = Blueprint("auth", __name__)
 
+env = os.getenv('FLASK_CONFIG')
 
 @auth_blueprint.route("/users", methods=["GET"])
 def get_users():
@@ -20,28 +21,43 @@ def get_users():
     return jsonify([user.username for user in users])
 
 
-@auth_blueprint.route("/register", methods=["POST"])
+@auth_blueprint.route("/register-user", methods=["POST"])
 def register():
     data = request.get_json()
+    conn = config_by_name.get(env).get_db_connection()
+    cursor = conn.cursor()
     try:
-        new_user = User(
-            username=data["username"],
-            email=data["email"],
-            user_id=data["userId"],
-            firstname=data["firstName"],
-            lastname=data["lastName"],
-            password=data["password"],
-            fullname=data["fullname"],
-            role="Admin",
-            feature=["epdm"],
-            tools=["epdm"],
+        validateDuplicate = sql.SQL("SELECT COUNT(*) FROM users WHERE email=%s")
+        cursor.execute(validateDuplicate, (data["email"],))
+        count = cursor.fetchone()[0]
+        if count>0:
+            return make_response(
+                jsonify({"message": "User already exists"}), 400
+            )
+        signupQuery = sql.SQL(
+            "INSERT INTO users (username,email,password_hash,role_id,status) VALUES (%s,%s,encrypt_password(%s),%s,%s)"
         )
-        db.session.add(new_user)
-        db.session.commit()
-        return jsonify({"message": "User registered successfully"}), 201
+        cursor.execute(
+            signupQuery,
+            (data["username"], data["email"], data["password"], 1, "active"),
+        )
+        cursor.connection.commit()
+        response = make_response(
+            jsonify(
+                {
+                    "message": "Registration successful",
+                    "role": "Admin",
+                    "username": data["username"],
+                }
+            ),
+            200,
+        )
+        return response
     except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": "An error occurred"}), 500
+        print(e)
+        error_message = str(e)
+        logging.error(f"User Registration Error: {e}")
+        return jsonify({"error": "An error occurred","message":error_message}), 500
 
 
 @auth_blueprint.route("/login", methods=["POST"])
@@ -49,34 +65,28 @@ def login():
     data = request.get_json()
     email = data.get("email")
     password = data.get("password")
-
-    conn = Config.get_db_connection()
+    print(env)
+    conn = config_by_name.get(env).get_db_connection()
     cursor = conn.cursor()
+    print(conn)
     try:
-        schema_query = sql.SQL(
-            "SELECT organization FROM mercury.email_organization_lookup WHERE email=%s"
-        )
-        cursor.execute(schema_query, (email,))
-        schema_result = cursor.fetchone()
-
-        if not schema_result:
-            return make_response(
-                jsonify({"message": "User does not exist in the organization"}), 404
-            )
-
-        org_schema_name = schema_result[0].lower()
 
         login_query = sql.SQL(
-            "SELECT * FROM mercury.mdxusers WHERE username=%s AND mercury.decrypt(password)=%s"
+            "SELECT * FROM users WHERE email=%s"
         )
-        cursor.execute(login_query, (email, password))
+        cursor.execute(login_query, (email,))
         user = cursor.fetchone()
-
+        print(user)
         if not user:
             return make_response(
-                jsonify({"message": "Invalid Username or Password"}), 401
+                jsonify({"message": "User not found"}), 404
             )
-
+        validation_query = """
+            SELECT decrypt_password(%s, %s)
+        """
+        cursor.execute(validation_query, (password, user[3]))
+        is_valid = cursor.fetchone()[0]
+        print(is_valid)
         session_id = str(uuid.uuid4())
         now = datetime.datetime.utcnow()
         formatted_date = moment.now().format("YYYY-MM-DD")
@@ -84,18 +94,15 @@ def login():
         log_file_path = os.path.join(Config.LOGS_PATH, log_filename)
 
         print(log_file_path)
-
+        print(user)
         # Generate JWT token
         token = jwt.encode(
             {
                 "userId": user[0],
-                "role": user[8],
-                "organisation": "mercury",
-                "user": user[3],
-                "tool": user[9],
+                "role": "Admin",
+                "user": user[1],
                 "email": email,
                 "serverlog": log_file_path,
-                "feature": user[9],
                 "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24),
             },
             Config.JWT_SECRET_KEY,
@@ -107,37 +114,19 @@ def login():
             os.makedirs(Config.LOGS_PATH)
         with open(log_file_path, "w") as log_file:
             log_file.write(
-                f"[{moment.now().format('YYYY-MM-DD hh:mm:ss A')}] User: {user[4]}, IP: {request.remote_addr}, User-Agent: {request.headers.get('User-Agent')} logged in\n"
+                f"[{moment.now().format('YYYY-MM-DD hh:mm:ss A')}] User: {user[1]}, IP: {request.remote_addr}, User-Agent: {request.headers.get('User-Agent')} logged in\n"
             )
             log_file.write(
                 f"[{moment.now().format('YYYY-MM-DD hh:mm:ss A')}] session id allocated is :: {session_id}\n"
             )
-
-        # Insert session data into the database
-        session_query = sql.SQL(
-            "INSERT INTO mercury.mdxsessions (session_id, user_id, ip_address, user_agent, status) VALUES (%s, %s, %s, %s, %s)"
-        )
-        cursor.execute(
-            session_query,
-            (
-                session_id,
-                user[7],
-                request.remote_addr,
-                request.headers.get("User-Agent"),
-                "Active",
-            ),
-        )
-        conn.commit()
 
         # Set cookies with the token and session ID
         response = make_response(
             jsonify(
                 {
                     "message": "Login successful",
-                    "role": user[8],
-                    "username": user[3],
-                    "tool": user[9],
-                    "organisation": org_schema_name,
+                    "role": "Admin",
+                    "username": user[1],
                     "userId": user[0],
                 }
             ),
@@ -167,27 +156,20 @@ def validateUser():
     role = data.get("role")
     userId = data.get("userId")
     user = data.get("user")
-    organisation = data.get("organisation")
     conn = Config.get_db_connection()
     cursor = conn.cursor()
 
     try:
-        schema_query = sql.SQL(
-            "SELECT organization FROM mercury.email_organization_lookup WHERE email=%s"
+        user_query = sql.SQL(
+            "SELECT * FROM users WHERE email=%s"
         )
-        cursor.execute(schema_query, (email,))
-        schema_result = cursor.fetchone()
-
-        if not schema_result:
-            return make_response(
-                jsonify({"message": "User does not exist in the organization"}), 404
-            )
-
-        org_schema_name = schema_result[0].lower()
-
-        validate_query = sql.SQL("SELECT * FROM mercury.mdxusers WHERE username = %s")
-        cursor.execute(validate_query, (email,))
+        cursor.execute(user_query, (email,))
         user = cursor.fetchone()
+
+        if not user:
+            return make_response(
+                jsonify({"message": "User does not exist"}), 404
+            )
 
         if not user:
             return make_response(
@@ -199,11 +181,9 @@ def validateUser():
                 {
                     "message": "User is logged in",
                     "user": {
-                        "role": role,
-                        "username": user[3],
-                        "tool": user[9],
-                        "organisation": organisation,
-                        "userId": userId,
+                        "role": "Admin",
+                        "username": user[1],
+                        "userId": user[0],
                     },
                 }
             ),
@@ -229,7 +209,6 @@ def logoutUser():
     session_id = request.cookies.get("sessionId")
     userId = data.get("userId")
     user = data.get("user")
-    organisation = data.get("organisation")
     conn = Config.get_db_connection()
     cursor = conn.cursor()
 
@@ -245,23 +224,6 @@ def logoutUser():
                 f"[{moment.now().format('YYYY-MM-DD hh:mm:ss A')}] User: {data.get('email')}, Logged out {request.headers.get('User-Agent')} on IP: {request.remote_addr}\n"
             )
 
-        # Insert session data into the database
-        session_query = sql.SQL(
-            "UPDATE mercury.mdxsessions "
-            "SET logout_time = CURRENT_TIMESTAMP, ip_address = %s, user_agent = %s, status = %s "
-            "WHERE session_id = %s AND user_id = %s"
-        )
-        cursor.execute(
-            session_query,
-            (
-                request.remote_addr,
-                request.headers.get("User-Agent"),
-                "In Active",
-                session_id,
-                user[7],
-            ),
-        )
-        conn.commit()
         response = make_response(
             jsonify(
                 {
@@ -270,12 +232,8 @@ def logoutUser():
             ),
             200,
         )
-        response.delete_cookie(
-            "token", httponly=True, secure=True, samesite="None"
-        )
-        response.delete_cookie(
-            "sessionId", httponly=True, secure=True, samesite="None"
-        )
+        response.delete_cookie("token", httponly=True, secure=True, samesite="None")
+        response.delete_cookie("sessionId", httponly=True, secure=True, samesite="None")
         return response
 
     except Exception as e:
@@ -286,3 +244,7 @@ def logoutUser():
         cursor.close()
         conn.close()
     # return jsonify({'message': 'User validated successfully','user':{'role':'Admin','organisation':'mavenberg','userId':1}}), 200
+
+# @auth_blueprint.route("/forget-password", methods=["POST"])
+# def forgetPassword():
+    
